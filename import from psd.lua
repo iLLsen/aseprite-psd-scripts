@@ -350,6 +350,9 @@ local function importFromPsd(filename)
     local layerAndMaskEnd = file:seek("cur") + layerAndMaskLength
     
     local layerInfoLength = readU32BE(file)
+    -- Bookmark the start of the layer info block (which begins with the layer count)
+    local layerInfoStart = file:seek("cur")
+
     local layerCount = readI16BE(file)
     
     if layerCount < 0 then
@@ -447,8 +450,8 @@ local function importFromPsd(filename)
             end
 
             if addKey == "lsct" and addLen >= 4 then      -- ★ Folder information found
-                layer.groupType = readU32BE(file)           -- 0/1/2=opener, 3=closer
-                layer.isGroup   = true
+                layer.groupType = readU32BE(file)           -- 0=other, 1/2=opener, 3=closer
+                layer.isGroup   = (layer.groupType == 1 or layer.groupType == 2 or layer.groupType == 3)
                 if padded > 4 then                          -- Skip remaining
                     file:read(padded - 4)
                 end
@@ -473,9 +476,12 @@ local function importFromPsd(filename)
             end
         end
         
+        -- ALWAYS ensure the file pointer is perfectly aligned to the end of the extra data block
+        file:seek("set", extraStart + extraLength)
+        
         layers[i] = layer
     end
-    
+
     -- Read channel image data
     for i = 1, layerCount do
         local layer = layers[i]
@@ -491,24 +497,41 @@ local function importFromPsd(filename)
             local decodedData = ""
             if #channelData >= 2 then
                 local compression = string.unpack(">I2", channelData:sub(1, 2))
-                if compression == 1 then
+                if compression == 0 then
+                    decodedData = channelData:sub(3)
+                elseif compression == 1 then
                     -- RLE compression
                     local imageHeight = layer.bounds.bottom - layer.bounds.top
-                    if imageHeight > 0 then
+                    if imageHeight > 0 and #channelData > 2 then
                         local rowSizeTableSize = imageHeight * 2
                         if #channelData >= 2 + rowSizeTableSize then
-                            local rowData = channelData:sub(3 + rowSizeTableSize)
-                            
-                            -- Remove padding if present (odd-length rows get 0x80 padding)
-                            if #rowData > 0 and string.byte(rowData, #rowData) == 0x80 and #rowData % 2 == 0 then
-                                rowData = rowData:sub(1, #rowData - 1)
+                            local rowSizesData = channelData:sub(3, 2 + rowSizeTableSize)
+                            local compressedRowsData = channelData:sub(3 + rowSizeTableSize)
+
+                            local decodedChunks = {}
+                            local dataOffset = 1
+
+                            for y = 1, imageHeight do
+                                local rowSize = string.unpack(">I2", rowSizesData:sub((y-1)*2 + 1, y*2))
+                                if dataOffset + rowSize - 1 <= #compressedRowsData then
+                                    local compressedRow = compressedRowsData:sub(dataOffset, dataOffset + rowSize - 1)
+                                    decodedChunks[#decodedChunks + 1] = unpackBits(compressedRow)
+                                    dataOffset = dataOffset + rowSize
+                                else
+                                    -- Data is truncated or corrupt, stop processing this channel
+                                    break
+                                end
                             end
-                            
-                            decodedData = unpackBits(rowData)
+                            decodedData = table.concat(decodedChunks)
                         end
                     end
+                elseif compression == 2 or compression == 3 then
+                    -- ZIP / ZIP with prediction compression (used by Photopea) is not supported.
+                    file:close()
+                    return false, "Unsupported compression method (" .. compression .. ") in layer '" .. layer.name .. "'.\n\nThis file uses ZIP compression, which is common for PSDs saved from Photopea. This script cannot decompress ZIP data because Aseprite's Lua environment does not provide the necessary tools."
                 else
-                    decodedData = channelData:sub(3)
+                    file:close()
+                    return false, "Unsupported compression method (" .. compression .. ") in layer '" .. layer.name .. "'."
                 end
             end
             
@@ -543,10 +566,9 @@ local function importFromPsd(filename)
         ------------------------------------------------------------
         if layerInfo.isGroup then
             ----------------------------------------------------------
-            -- A. Opener: type 0·1·2  →  Create folder and continue
+            -- A. Opener: type 1·2  →  Create folder and continue
             ----------------------------------------------------------
-            if layerInfo.groupType == 0 or layerInfo.groupType == 1
-               or layerInfo.groupType == 2 then
+            if layerInfo.groupType == 1 or layerInfo.groupType == 2 then
 
                 local grp = sprite:newGroup()
                 grp.name       = safeUtf8(layerInfo.name)
@@ -753,4 +775,3 @@ else
         io.stderr:write("Usage: aseprite -b -script 'import from psd.lua' --filename=file.psd")
     end
 end
-
